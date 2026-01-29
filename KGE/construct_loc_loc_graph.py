@@ -7,6 +7,7 @@ from tqdm import tqdm
 from scipy.sparse import lil_matrix
 import argparse
 from dataloader import PoiDataloader
+from scipy.sparse import csr_matrix
 
 device = torch.device("cuda", 0)
 
@@ -27,29 +28,28 @@ def projection_transR(original, proj_matrix):  # (batch, k_dim)   (batch, k_dim 
 
 
 def calculate_score(h_e, t_e, rel, model_type, L1_flag=True, norm=None, proj=None):
-    if model_type == "transe":
-        if L1_flag:
-            score = torch.exp(-torch.sum(torch.abs(h_e + rel - t_e), 1))
-        else:
-            score = torch.exp(-torch.sum(torch.abs(h_e + rel - t_e) ** 2, 1))
+    # h_e shape: [block, 1, hidden]
+    # t_e shape: [1, loc_count, hidden]
+    # rel shape: [hidden] (or broadcastable)
 
+    if model_type == "transe":
+        diff = h_e + rel - t_e
     elif model_type == "transh":
         proj_h_e = projection_transH(h_e, norm)
         proj_t_e = projection_transH(t_e, norm)
-        if L1_flag:
-            score = torch.exp(-torch.sum(torch.abs(proj_h_e + rel - proj_t_e), 1))
-        else:
-            score = torch.exp(-torch.sum(torch.abs(proj_h_e + rel - proj_t_e) ** 2, 1))
-
-    else:
+        diff = proj_h_e + rel - proj_t_e
+    else:  # transr
         proj_h_e = projection_transR(h_e, proj)
         proj_t_e = projection_transR(t_e, proj)
-        if L1_flag:
-            score = torch.exp(-torch.sum(torch.abs(proj_h_e + rel - proj_t_e), 1))
-        else:
-            score = torch.exp(-torch.sum(torch.abs(proj_h_e + rel - proj_t_e) ** 2, 1))
+        diff = proj_h_e + rel - proj_t_e
 
-    return score
+    # dim=-1 ensures we sum over the embedding dimension only
+    if L1_flag:
+        score = torch.exp(-torch.sum(torch.abs(diff), dim=-1))
+    else:
+        score = torch.exp(-torch.sum(diff**2, dim=-1))
+
+    return score  # Returns [block, loc_count]
 
 
 def another_calculate_score(h_e, t_e, rel, model_type, L1_flag=True, norm=None, proj=None):
@@ -119,6 +119,69 @@ def construct_transition_graph(args, filename, loc_encoder, temporal_preference,
             pickle.dump(transition_graph, f, protocol=2)
     else:
         return transition_graph.tocsr()
+
+
+def construct_transition_graph(args, filename, loc_encoder, temporal_preference, norm_param=None, proj=None):
+    loc_count = args.loc_count if args.loc_graph else args.user_count
+    threshold = args.threshold
+    L1_flag = args.L1_flag
+    model_type = args.model_type
+    device = next(loc_encoder.parameters()).device
+
+    all_indices = torch.arange(loc_count, device=device)
+    all_embs = loc_encoder(all_indices)
+
+    rows, cols, datas = [], [], []
+    block_size = 500  # Start with 500 to be safe with memory; increase if possible
+
+    bar = tqdm(total=loc_count)
+    bar.set_description("Construct Transition Graph")
+
+    for start_idx in range(0, loc_count, block_size):
+        end_idx = min(start_idx + block_size, loc_count)
+        actual_block_size = end_idx - start_idx
+
+        h_e_block = all_embs[start_idx:end_idx]  # [actual_block_size, hidden]
+
+        # Trigger Broadcasting: [actual_block_size, 1, hidden] vs [1, loc_count, hidden]
+        scores = calculate_score(
+            h_e_block.unsqueeze(1), all_embs.unsqueeze(0), temporal_preference, model_type, L1_flag, norm_param, proj
+        )  # Result: [actual_block_size, loc_count]
+
+        # Mask self-loops: the diagonal in the score matrix for this block
+        # is at (i, start_idx + i)
+        row_indices = torch.arange(actual_block_size, device=device)
+        col_indices = torch.arange(start_idx, end_idx, device=device)
+        scores[row_indices, col_indices] = float("-inf")
+
+        # Vectorized Top-K
+        topk_scores, topk_indices = torch.topk(scores, k=threshold, dim=1)
+
+        # Normalize: topk_scores is already sorted, so [:, 0] is the max
+        max_scores = topk_scores[:, 0:1]
+        norm_scores = topk_scores / (max_scores + 1e-10)
+
+        # Collect for sparse matrix
+        rows.append(torch.arange(start_idx, end_idx).view(-1, 1).repeat(1, threshold).numpy())
+        cols.append(topk_indices.cpu().numpy())
+        datas.append(norm_scores.cpu().numpy())
+
+        bar.update(actual_block_size)
+
+    bar.close()
+
+    # Efficient CSR construction
+    rows = np.concatenate(rows).ravel()
+    cols = np.concatenate(cols).ravel()
+    datas = np.concatenate(datas).ravel()
+
+    transition_graph = csr_matrix((datas, (rows, cols)), shape=(loc_count, loc_count))
+
+    if args.loc_graph:
+        with open(filename, "wb") as f:
+            pickle.dump(transition_graph, f, protocol=2)
+    else:
+        return transition_graph
 
 
 def construct_interact_graph(args, user_encoder, loc_encoder, interact_preference, norm=None, proj=None):

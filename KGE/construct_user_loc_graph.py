@@ -24,57 +24,88 @@ def projection_transR(original, proj_matrix):  # (batch, k_dim)   (batch, k_dim 
 
 
 def calculate_score(h_e, t_e, rel, model_type, L1_flag=True, norm=None, proj=None):
-    if model_type == "transe":
-        if L1_flag:
-            score = torch.exp(-torch.sum(torch.abs(h_e + rel - t_e), 1))
-        else:
-            score = torch.exp(-torch.sum(torch.abs(h_e + rel - t_e) ** 2, 1))
+    # h_e: [Batch, 1, Hidden]
+    # t_e: [1, Loc_Count, Hidden]
+    # rel: [Hidden]
 
+    if model_type == "transe":
+        diff = h_e + rel - t_e
     elif model_type == "transh":
         proj_h_e = projection_transH(h_e, norm)
         proj_t_e = projection_transH(t_e, norm)
-        if L1_flag:
-            score = torch.exp(-torch.sum(torch.abs(proj_h_e + rel - proj_t_e), 1))
-        else:
-            score = torch.exp(-torch.sum(torch.abs(proj_h_e + rel - proj_t_e) ** 2, 1))
-
-    else:
+        diff = proj_h_e + rel - proj_t_e
+    else:  # transr
         proj_h_e = projection_transR(h_e, proj)
         proj_t_e = projection_transR(t_e, proj)
-        if L1_flag:
-            score = torch.exp(-torch.sum(torch.abs(proj_h_e + rel - proj_t_e), 1))
-        else:
-            score = torch.exp(-torch.sum(torch.abs(proj_h_e + rel - proj_t_e) ** 2, 1))
+        diff = proj_h_e + rel - proj_t_e
 
-    return score
+    # Use dim=-1 to support any input rank (2D or 3D)
+    if L1_flag:
+        dist = torch.sum(torch.abs(diff), dim=-1)
+    else:
+        dist = torch.sum(diff**2, dim=-1)
+
+    return torch.exp(-dist)  # Returns [Batch, Loc_Count]
 
 
-def construct_transition_graph(args, filename, user_encoder, loc_encoder, temporal_preference, norm=None, proj=None):
+def construct_transition_graph(
+    args, filename, user_encoder, loc_encoder, temporal_preference, norm_param=None, proj=None
+):
     loc_count = args.loc_count
     user_count = args.user_count
-
     threshold = args.threshold
     L1_flag = args.L1_flag
     model_type = args.model_type
+    device = next(user_encoder.parameters()).device
 
-    bar = tqdm(total=user_count)
-    bar.set_description("Construct User-POI Graph")
+    # Pre-fetch POI embeddings (they stay constant for every user block)
+    loc_indices = torch.arange(loc_count, device=device)
+    t_e_all = loc_encoder(loc_indices).unsqueeze(0)  # [1, loc_count, hidden]
 
-    transition_graph = lil_matrix((user_count, loc_count), dtype=np.float32)  # directed graph
-    for i in range(user_count):
-        h_e = user_encoder(torch.LongTensor([i]).to(device))
-        t_list = list(range(loc_count))
-        t_e = loc_encoder(torch.LongTensor(t_list).to(device))
+    # Pre-fetch all user embeddings
+    user_indices = torch.arange(user_count, device=device)
+    h_e_all = user_encoder(user_indices)  # [user_count, hidden]
 
-        transition_vector = calculate_score(h_e, t_e, temporal_preference, model_type, L1_flag, norm, proj)
-        indices = torch.argsort(transition_vector, descending=True)[:threshold]  # top_k
-        norm = torch.max(transition_vector[indices])
-        for index in indices:
-            index = index.item()
-            transition_graph[i, index] = (transition_vector[index] / norm).item()
+    rows, cols, datas = [], [], []
+    block_size = 500  # Adjust based on VRAM
 
-        bar.update(1)
+    bar = tqdm(total=user_count, desc="Construct User-POI Graph")
+
+    for start_idx in range(0, user_count, block_size):
+        end_idx = min(start_idx + block_size, user_count)
+        h_e_block = h_e_all[start_idx:end_idx].unsqueeze(1)  # [block, 1, hidden]
+
+        # Batch calculation via broadcasting
+        transition_matrix = calculate_score(
+            h_e_block, t_e_all, temporal_preference, model_type, L1_flag, norm_param, proj
+        )  # [block, loc_count]
+
+        # Vectorized Top-K selection
+        topk_scores, topk_indices = torch.topk(transition_matrix, k=threshold, dim=1)
+
+        # Row-wise normalization (using the max score of the top-k)
+        row_max = topk_scores[:, 0:1]
+        norm_scores = topk_scores / (row_max + 1e-10)
+
+        # CPU transfer and storage
+        # Create row indices for the current block
+        curr_block_size = end_idx - start_idx
+        batch_rows = torch.arange(start_idx, end_idx, device=device).view(-1, 1).expand(-1, threshold)
+
+        rows.append(batch_rows.cpu().numpy())
+        cols.append(topk_indices.cpu().numpy())
+        datas.append(norm_scores.cpu().numpy())
+
+        bar.update(curr_block_size)
+
     bar.close()
+
+    # Flatten and build CSR matrix (much faster than LIL)
+    rows = np.concatenate(rows).ravel()
+    cols = np.concatenate(cols).ravel()
+    datas = np.concatenate(datas).ravel()
+
+    transition_graph = csr_matrix((datas, (rows, cols)), shape=(user_count, loc_count))
 
     with open(filename, "wb") as f:
         pickle.dump(transition_graph, f, protocol=2)
