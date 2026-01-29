@@ -10,46 +10,35 @@ from dataloader import PoiDataloader
 from math import radians, cos, sin, asin, sqrt
 from tqdm import tqdm
 from collections import defaultdict
-from constant import DATA_NAME, SCHEME
+from constant import SCHEME
+from dataset import Split
+import numpy as np
+from sklearn.neighbors import BallTree
 
 
-def haversine(lat1, lon1, lat2, lon2):
-    """
-    Calculate the great circle distance between two points
-    on the earth (specified in decimal degrees)
-    """
-    # convert decimal degrees to radians
-    lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
-
-    # haversine formula
-    dlon = lon2 - lon1
-    dlat = lat2 - lat1
-    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
-    c = 2 * asin(sqrt(a))
-    r = 6371  # Radius of earth in kilometers. Use 3956 for miles
-    return c * r
-
-
-def generate_train_test_checkin(train_file, test_file):
-    if os.path.exists(train_file):
-        print("train.txt and test.txt has existed!!!")
-        return
-
-    with open(train_file, "w+") as f_train, open(test_file, "w+") as f_test:
-        for i, (user, loc) in enumerate(zip(users, pois)):
-            train_thr = int(len(loc) * 0.8)
-            train_locs = loc[:train_thr]
-            test_locs = loc[train_thr:]
-            train_locs.insert(0, user)
-            test_locs.insert(0, user)
-
-            for train_elem in train_locs:
+def generate_checkin_files(train_file, test_file, valid_file):
+    with open(train_file, "w+") as f_train:
+        for user, locs in zip(train_dataset.users, train_dataset.user_trajectories):
+            locs.insert(0, user)
+            for train_elem in locs:
                 f_train.write(str(train_elem) + " ")
             f_train.write("\n")
-            for test_elem in test_locs:
+
+    with open(test_file, "w+") as f_test:
+        for user, locs in zip(test_dataset.users, test_dataset.user_trajectories):
+            locs.insert(0, user)
+            for test_elem in locs:
                 f_test.write(str(test_elem) + " ")
             f_test.write("\n")
-    print("Successfully generate train/test checkins!")
+
+    with open(valid_file, "w+") as f_valid:
+        for user, locs in zip(val_dataset.users, val_dataset.user_trajectories):
+            locs.insert(0, user)
+            for valid_elem in locs:
+                f_valid.write(str(valid_elem) + " ")
+            f_valid.write("\n")
+
+    print("Successfully generate train/test/valid checkins!")
 
 
 def generate_entity_file(entity2id_file):  # 构造entity2id文件
@@ -70,7 +59,7 @@ def generate_entity_file(entity2id_file):  # 构造entity2id文件
     print("Successfully generate entity2id.txt!")
 
 
-def generate_train_test_triplets(train_file, train_triplets_file, friendship_file):  # 构造train/test 三元组
+def generate_triplets(train_file, train_triplets_file):  # 构造train/test 三元组
     f_train_triplets = open(train_triplets_file, "w+")
     print("Construct interact relation and temporal relation......")
     with tqdm(total=users_count) as bar:
@@ -101,85 +90,73 @@ def generate_train_test_triplets(train_file, train_triplets_file, friendship_fil
 
     # 构建spatial关系  两个poi的距离小于距离阈值lambda_d，就相连
     print("Construct spatial relation......")
-    pois_list = []
-    for poi, coord in poi2gps.items():  # 生成元组列表, 即[(poi_1, coord_1), ...]
-        pois_list.append((poi, coord))
+    pois_items = list(poi2gps.items())
+    poi_org_ids = np.array([item[0] + users_count for item in pois_items])
+    coords = np.array([item[1] for item in pois_items])
+
+    # BallTree haversine requires coordinates in RADIANS
+    coords_rad = np.radians(coords)
+    tree = BallTree(coords_rad, metric="haversine")
+
+    EARTH_RADIUS = 6371.0
 
     # 方案1
     if SCHEME == 1:
         lambda_d = 0.2  # 距离阈值为0.2千米
-        with tqdm(total=len(pois_list)) as bar:
-            for i in range(len(pois_list)):
-                for j in range(i + 1, len(pois_list)):
-                    poi_prev, coord_prev = pois_list[i]
-                    poi_next, coord_next = pois_list[j]
+        radius_rad = lambda_d / EARTH_RADIUS
 
-                    poi_prev = poi_prev + users_count  # poi在entity中所对应的实体集
-                    poi_next = poi_next + users_count
-                    lat_prev, lon_prev = coord_prev
-                    lat_next, lon_next = coord_next
+        # query_radius returns indices of all points within distance
+        indices = tree.query_radius(coords_rad, r=radius_rad)
 
-                    dist = haversine(lat_prev, lon_prev, lat_next, lon_next)
-                    if dist <= lambda_d:
-                        f_train_triplets.write(str(poi_prev) + "\t")
-                        f_train_triplets.write(str(poi_next) + "\t")
-                        f_train_triplets.write("2" + "\n")  # 2代表spatial relation
-                        # spatial relation是对称的
-                        f_train_triplets.write(str(poi_next) + "\t")
-                        f_train_triplets.write(str(poi_prev) + "\t")
-                        f_train_triplets.write("2" + "\n")
-
-                bar.update(1)
+        for i, neighbors in enumerate(tqdm(indices)):
+            this_poi = poi_org_ids[i]
+            output = []
+            for neighbor_idx in neighbors:
+                if i < neighbor_idx:  # Ensure we only process each pair once
+                    neighbor_poi = poi_org_ids[neighbor_idx]
+                    output.append(f"{this_poi}\t{neighbor_poi}\t2\n")
+                    output.append(f"{neighbor_poi}\t{this_poi}\t2\n")
+            f_train_triplets.write("".join(output))
 
     # 方案2
     else:
         lambda_d = 3  # 距离阈值为3千米, 再取top k, 即双重限制
-        with tqdm(total=len(pois_list)) as bar:
-            for i in range(len(pois_list)):
-                loci_list = []
-                for j in range(len(pois_list)):
-                    poi_prev, coord_prev = pois_list[i]
-                    poi_next, coord_next = pois_list[j]
+        max_k = 51  # top 50 + 1 (itself)
+        radius_rad = lambda_d / EARTH_RADIUS
+        # query returns (distances, indices) for top k nearest
+        for i in tqdm(range(len(coords_rad))):
+            this_poi = poi_org_ids[i]
+            # Find neighbors within 3km, then pick top 50
+            dist, ind = tree.query(coords_rad[i : i + 1], k=max_k)
 
-                    poi_prev = poi_prev + users_count  # poi在entity中所对应的实体集
-                    poi_next = poi_next + users_count
-                    lat_prev, lon_prev = coord_prev
-                    lat_next, lon_next = coord_next
+            output = []
+            for d, idx in zip(dist[0], ind[0]):
+                neighbor_poi = poi_org_ids[idx]
+                # Check if within 3km and not itself
+                if d <= radius_rad and this_poi != neighbor_poi:
+                    output.append(f"{this_poi}\t{neighbor_poi}\t2\n")
+                    output.append(f"{neighbor_poi}\t{this_poi}\t2\n")
 
-                    dist = haversine(lat_prev, lon_prev, lat_next, lon_next)
-                    if dist <= lambda_d and poi_prev != poi_next:
-                        loci_list.append((poi_next, dist))  # 先是第一重限制, 这样可能会造成很多重复计算
+            # Since Scheme 2 is top-k per POI, it's naturally directed/symmetric here
+            f_train_triplets.write("".join(output[:100]))  # 50 pairs * 2 lines
 
-                sort_list = sorted(loci_list, key=lambda x: x[1])  # 从小到大排序,距离越小,排名越靠前
-                length = min(len(sort_list), 50)
-                select_pois = sort_list[:length]  # 一般情况下, sort_list的长度肯定不止50, 取top 50  这是第二重限制
-                for poi_entity, _ in select_pois:
-                    f_train_triplets.write(str(poi_prev) + "\t")
-                    f_train_triplets.write(str(poi_entity) + "\t")
-                    f_train_triplets.write("2" + "\n")  # 2代表spatial relation
-                    # spatial relation是对称的
-                    f_train_triplets.write(str(poi_entity) + "\t")
-                    f_train_triplets.write(str(poi_prev) + "\t")
-                    f_train_triplets.write("2" + "\n")
-
-                bar.update(1)
-
+    # NOTE: ignore friend relation construction: https://github.com/kevin-xuan/Graph-Flashback/issues/9
     # 构建friend关系  互为朋友的user相连  这个train/test会重复构造一次,可以选择生成一个friend_triplet文件,然后再将其内容放入train/test
     # 但因为数量很少,构造很快,所以放在一起
-    print("Construct friend relation......")
-    with open(friendship_file, "r") as f_friend:
-        for friend_line in f_friend.readlines():
-            tokens = friend_line.strip("\n").split("\t")
-            if user2id.get(int(tokens[0])) and user2id.get(int(tokens[1])):  # only focus on active users
-                user_id1 = str(user2id.get(int(tokens[0])))
-                user_id2 = str(user2id.get(int(tokens[1])))
-                f_train_triplets.write(user_id1 + "\t")
-                f_train_triplets.write(user_id2 + "\t")
-                f_train_triplets.write("3" + "\n")  # 2代表friend relation
-                # friend relation是对称的
-                f_train_triplets.write(user_id2 + "\t")
-                f_train_triplets.write(user_id1 + "\t")
-                f_train_triplets.write("3" + "\n")
+    # print("Construct friend relation......")
+    # with open(friendship_file, "r") as f_friend:
+    #     for friend_line in f_friend.readlines():
+    #         tokens = friend_line.strip("\n").split("\t")
+    #         if user2id.get(int(tokens[0])) and user2id.get(int(tokens[1])):  # only focus on active users
+    #             user_id1 = str(user2id.get(int(tokens[0])))
+    #             user_id2 = str(user2id.get(int(tokens[1])))
+    #             f_train_triplets.write(user_id1 + "\t")
+    #             f_train_triplets.write(user_id2 + "\t")
+    #             f_train_triplets.write("3" + "\n")  # 2代表friend relation
+    #             # friend relation是对称的
+    #             f_train_triplets.write(user_id2 + "\t")
+    #             f_train_triplets.write(user_id1 + "\t")
+    #             f_train_triplets.write("3" + "\n")
     f_train_triplets.close()
 
 
@@ -226,41 +203,55 @@ if __name__ == "__main__":
 
     # load dataset
     poi_loader = PoiDataloader(setting.max_users, setting.min_checkins)  # 0， 5*20+1
-    poi_loader.read(setting.dataset_file)
-    print("Active POI number: ", poi_loader.locations())  # 18737
-    print("Active User number: ", poi_loader.user_count())  # 32510
-    print("Total Checkins number: ", poi_loader.checkins_count())  # 1278274
+    poi_loader.read(setting.dataset_train_file, setting.dataset_val_file, setting.dataset_test_file)
 
-    users = poi_loader.users
-    pois = poi_loader.locs  # 二重列表，每个元素是user对应的checkin数据
+    train_dataset = poi_loader.create_dataset(setting.sequence_length, setting.batch_size, Split.TRAIN)
+    val_dataset = poi_loader.create_dataset(setting.sequence_length, setting.batch_size, Split.VAL)
+    test_dataset = poi_loader.create_dataset(setting.sequence_length, setting.batch_size, Split.TEST)
+
+    # poi_loader.read(setting.dataset_file)
+    print("Active POI number: ", poi_loader.locations())
+    print("Active User number: ", poi_loader.user_count())
+    print("Total Checkins number: ", poi_loader.checkins_count())
+
+    # global mapping
     user2id = poi_loader.user2id
     poi2id = poi_loader.poi2id
     poi2gps = poi_loader.poi2gps
-    data_path = "./dataset/{}/{}_scheme{}".format(DATA_NAME, DATA_NAME, SCHEME)
+    users_count = len(poi_loader.users)
+
+    data_path = "./dataset/{}/{}_scheme{}".format(setting.city, setting.city, SCHEME)
     if not os.path.exists(data_path):
         os.makedirs(data_path)
-    users_count = len(users)
+
     # generate train & test file
 
     train_file = os.path.join(data_path, "train.txt")
     test_file = os.path.join(data_path, "test.txt")
+    valid_file = os.path.join(data_path, "valid.txt")
     entity2id_file = os.path.join(data_path, "entity2id.txt")
 
     train_triplets = os.path.join(data_path, "train_triplets.txt")
     test_triplets = os.path.join(data_path, "test_triplets.txt")
-    friendship_file = setting.friend_file
+    valid_triplets = os.path.join(data_path, "valid_triplets.txt")
 
     final_train_triplets = os.path.join(data_path, "final_train_triplets.txt")
     final_test_triplets = os.path.join(data_path, "final_test_triplets.txt")
+    final_valid_triplets = os.path.join(data_path, "final_valid_triplets.txt")
 
     print("Generate train/test checkins......")
-    generate_train_test_checkin(train_file, test_file)  # 划分train/test check-ins
+    generate_checkin_files(train_file, test_file, valid_file)
+
     print("Generate entity2id......")
     generate_entity_file(entity2id_file)
-    print("Construct train triplets......")
-    generate_train_test_triplets(train_file, train_triplets, friendship_file)  # 生成train/test三元组
-    print("Construct test triplets......")
-    generate_train_test_triplets(test_file, test_triplets, friendship_file)
 
-    train_filter_triplets = filter_train_triplet(train_triplets, final_train_triplets)  # train三元组去重
-    filter_test_triplet(test_triplets, final_test_triplets, train_filter_triplets)  # test三元组去重
+    print("Construct train triplets......")
+    generate_triplets(train_file, train_triplets)
+    print("Construct test triplets......")
+    generate_triplets(test_file, test_triplets)
+    print("Construct valid triplets......")
+    generate_triplets(valid_file, valid_triplets)
+
+    train_filter_triplets = filter_train_triplet(train_triplets, final_train_triplets)
+    filter_test_triplet(test_triplets, final_test_triplets, train_filter_triplets)
+    filter_test_triplet(valid_triplets, final_valid_triplets, train_filter_triplets)

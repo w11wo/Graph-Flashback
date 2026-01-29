@@ -1,10 +1,15 @@
 # 因为final_train_triplets.txt包含了所有friend以及spatial关系,造成final_test_triplets.txt里没有这两种关系.
 # 因此需要将训练集中的两种关系以8:2划分,并保留原先的数据文件
-from constant import DATA_NAME, SCHEME
+from constant import SCHEME
+from argparse import ArgumentParser
 
 if __name__ == "__main__":
-    new_train_triplets = "./dataset/{}/{}_scheme{}/new_final_train_triplets.txt".format(DATA_NAME, DATA_NAME, SCHEME)
-    new_test_triplets = "./dataset/{}/{}_scheme{}/new_final_test_triplets.txt".format(DATA_NAME, DATA_NAME, SCHEME)
+    parser = ArgumentParser()
+    parser.add_argument("--city", type=str, help="the city to process")
+    args = parser.parse_args()
+
+    new_train_triplets = "./dataset/{}/{}_scheme{}/new_final_train_triplets.txt".format(args.city, args.city, SCHEME)
+    new_test_triplets = "./dataset/{}/{}_scheme{}/new_final_test_triplets.txt".format(args.city, args.city, SCHEME)
     f_new_train = open(new_train_triplets, "w+")
     f_new_test = open(new_test_triplets, "w+")
 
@@ -13,7 +18,7 @@ if __name__ == "__main__":
     ratio = 0.8
 
     # 原封不动地把interact和temporal三元组写入新文件中
-    with open("./dataset/{}/{}_scheme{}/final_test_triplets.txt".format(DATA_NAME, DATA_NAME, SCHEME), "r") as f_test:
+    with open("./dataset/{}/{}_scheme{}/final_test_triplets.txt".format(args.city, args.city, SCHEME), "r") as f_test:
         for line in f_test.readlines():
             tokens = tuple(line.strip("\n").split("\t"))
             h, t, r = tokens  # str
@@ -21,7 +26,9 @@ if __name__ == "__main__":
             f_new_test.write(t + "\t")
             f_new_test.write(r + "\n")
 
-    with open("./dataset/{}/scheme_{}/final_train_triplets.txt", "r").format(DATA_NAME, SCHEME) as f_train:
+    with open(
+        "./dataset/{}/{}_scheme{}/final_train_triplets.txt".format(args.city, args.city, SCHEME), "r"
+    ) as f_train:
         for line in f_train.readlines():
             tokens = tuple(line.strip("\n").split("\t"))
             h, t, r = tokens  # str

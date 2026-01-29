@@ -5,3 +5,5 @@ data/checkins-*.txt
 data/pretrained-model
 KGE/Graphs
 results
+data
+dataset
