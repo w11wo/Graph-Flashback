@@ -54,7 +54,7 @@ class FlashbackTrainer:
     def parameters(self):
         return self.model.parameters()
 
-    def prepare(self, loc_count, user_count, hidden_size, gru_factory, device):
+    def prepare(self, loc_count, user_count, hidden_size, gru_factory, padding_idx, device):
         def f_t(delta_t, user_len):
             return ((torch.cos(delta_t * 2 * np.pi / 86400) + 1) / 2) * torch.exp(
                 -(delta_t / 86400 * self.lambda_t)
@@ -82,9 +82,10 @@ class FlashbackTrainer:
             self.use_graph_user,
             self.use_spatial_graph,
             self.interact_graph,
+            padding_idx,
         ).to(device)
 
-    def evaluate(self, x, t, t_slot, s, y_t, y_t_slot, y_s, h, active_users):
+    def evaluate(self, x, t, t_slot, s, lengths, h, active_users):
         """takes a batch (users x location sequence)
         then does the prediction and returns a list of user x sequence x location
         describing the probabilities for each location at each position in the sequence.
@@ -95,19 +96,17 @@ class FlashbackTrainer:
 
         self.model.eval()
         # (seq_len, user_len, loc_count)
-        out, h = self.model(x, t, t_slot, s, y_t, y_t_slot, y_s, h, active_users)
+        out, h = self.model(x, t, t_slot, s, lengths, h, active_users)
 
         out_t = out.transpose(0, 1)
         return out_t, h  # model outputs logits
 
-    def loss(self, x, t, t_slot, s, y, y_t, y_t_slot, y_s, h, active_users):
+    def loss(self, x, t, t_slot, s, y, lengths, h, active_users):
         """takes a batch (users x location sequence)
         and corresponding targets in order to compute the training loss"""
 
         self.model.train()
-        out, h = self.model(
-            x, t, t_slot, s, y_t, y_t_slot, y_s, h, active_users
-        )  # out (seq_len, batch_size, loc_count)
+        out, h = self.model(x, t, t_slot, s, lengths, h, active_users)  # out (seq_len, batch_size, loc_count)
         out = out.view(-1, self.loc_count)  # (seq_len * batch_size, loc_count)
 
         y = y.view(-1)  # (seq_len * batch_size)

@@ -84,6 +84,7 @@ class PoiDataloader:
             self.poi2id[row["venue_id"]]: (row["latitude"], row["longitude"]) for _, row in all_df.iterrows()
         }
         self.user2id = {val: i for i, val in enumerate(all_df["user_id"].unique())}
+        self.users = list(self.user2id.values())
 
         def process_split(df, target_dict):
             # Group by trail_id to keep trajectories together

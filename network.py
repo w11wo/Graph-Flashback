@@ -76,6 +76,7 @@ class Flashback(nn.Module):
         use_graph_user,
         use_spatial_graph,
         interact_graph,
+        padding_idx,
     ):
         super().__init__()
         self.input_size = input_size  # POI个数
@@ -101,25 +102,24 @@ class Flashback(nn.Module):
         else:
             self.interact_graph = None
 
-        self.encoder = nn.Embedding(input_size, hidden_size)  # location embedding
-        # self.time_encoder = nn.Embedding(24 * 7, hidden_size)  # time embedding
+        self.encoder = nn.Embedding(input_size + 1, hidden_size, padding_idx=padding_idx)  # location embedding
         self.user_encoder = nn.Embedding(user_count, hidden_size)  # user embedding
         self.rnn = rnn_factory.create(hidden_size)
         self.fc = nn.Linear(2 * hidden_size, input_size)
 
-    def forward(self, x, t, t_slot, s, y_t, y_t_slot, y_s, h, active_user):
+    def forward(self, x, t, t_slot, s, lengths, h, active_user):
+        # 1. Ensure active_user is 1D: [user_len]
+        if active_user.dim() > 1:
+            active_user = active_user.view(-1)
+
         seq_len, user_len = x.size()
         x_emb = self.encoder(x)
 
         # 是否用GCN来更新user embedding
         if self.use_graph_user:
-            # I_f = identity(self.friend_graph.shape[0], format='coo')
-            # friend_graph = (self.friend_graph * self.lambda_user + I_f).astype(np.float32)
-            # friend_graph = calculate_random_walk_matrix(friend_graph)
-            # friend_graph = sparse_matrix_to_tensor(friend_graph).to(x.device)
             friend_graph = self.friend_graph.to(x.device)
-            # AX
-            user_emb = self.user_encoder(torch.LongTensor(list(range(self.user_count))).to(x.device))
+            user_all_indices = torch.arange(self.user_count, device=device)
+            user_emb = self.user_encoder(user_all_indices)
             user_encoder_weight = torch.sparse.mm(friend_graph, user_emb).to(x.device)  # (user_count, hidden_size)
 
             if self.use_weight:
@@ -130,12 +130,14 @@ class Flashback(nn.Module):
             # (user_len, hidden_size)
             p_u = p_u.view(user_len, self.hidden_size)
 
-        p_u = self.user_encoder(active_user)  # (1, user_len, hidden_size)
-        p_u = p_u.view(user_len, self.hidden_size)
-        # AX,即GCN
+        # GCN for location embedding
         graph = self.graph.to(x.device)
-        loc_emb = self.encoder(torch.LongTensor(list(range(self.input_size))).to(x.device))
+        loc_indices = torch.arange(self.input_size, device=device)
+        loc_emb = self.encoder(loc_indices)
         encoder_weight = torch.sparse.mm(graph, loc_emb).to(x.device)  # (input_size, hidden_size)
+
+        padding_weight = torch.zeros(1, self.hidden_size, device=x.device)
+        encoder_weight = torch.cat([encoder_weight, padding_weight], dim=0)
 
         if self.use_spatial_graph:
             spatial_graph = (self.spatial_graph * self.lambda_loc + self.I).astype(np.float32)
@@ -144,49 +146,55 @@ class Flashback(nn.Module):
             encoder_weight += torch.sparse.mm(spatial_graph, loc_emb).to(x.device)
             encoder_weight /= 2  # 求均值
 
-        new_x_emb = []
-        for i in range(seq_len):
-            # (user_len, hidden_size)
-            temp_x = torch.index_select(encoder_weight, 0, x[i])
-            new_x_emb.append(temp_x)
+        x_emb = torch.index_select(encoder_weight, 0, x.view(-1)).view(seq_len, user_len, -1)
 
-        x_emb = torch.stack(new_x_emb, dim=0)
-
-        # user-poi
-        loc_emb = self.encoder(torch.LongTensor(list(range(self.input_size))).to(x.device))
-        encoder_weight = loc_emb
-        interact_graph = self.interact_graph.to(x.device)
-        encoder_weight_user = torch.sparse.mm(interact_graph, encoder_weight).to(x.device)
+        interact_graph = self.interact_graph.to(device)
+        encoder_weight_user = torch.sparse.mm(interact_graph, loc_emb)
 
         user_preference = torch.index_select(encoder_weight_user, 0, active_user.squeeze()).unsqueeze(0)
-        # print(user_preference.size())
-        user_loc_similarity = torch.exp(-(torch.norm(user_preference - x_emb, p=2, dim=-1))).to(x.device)
-        user_loc_similarity = user_loc_similarity.permute(1, 0)
+        user_loc_similarity = torch.exp(-torch.norm(user_preference - x_emb, p=2, dim=-1))
 
-        out, h = self.rnn(x_emb, h)  # (seq_len, user_len, hidden_size)
-        out_w = torch.zeros(seq_len, user_len, self.hidden_size, device=x.device)
+        packed_x = torch.nn.utils.rnn.pack_padded_sequence(x_emb, lengths.cpu(), enforce_sorted=False)
+        packed_out, h = self.rnn(packed_x, h)
+        out, _ = torch.nn.utils.rnn.pad_packed_sequence(packed_out)  # [seq_len, user_len, hidden_size]
 
-        for i in range(seq_len):
-            sum_w = torch.zeros(user_len, 1, device=x.device)  # (200, 1)
-            for j in range(i + 1):
-                dist_t = t[i] - t[j]
-                dist_s = torch.norm(s[i] - s[j], dim=-1)
-                a_j = self.f_t(dist_t, user_len)  # (user_len, )
-                b_j = self.f_s(dist_s, user_len)
-                a_j = a_j.unsqueeze(1)  # (user_len, 1)
-                b_j = b_j.unsqueeze(1)
-                w_j = a_j * b_j + 1e-10  # small epsilon to avoid 0 division
-                w_j = w_j * user_loc_similarity[:, j].unsqueeze(1)  # (user_len, 1)
-                sum_w += w_j
-                out_w[i] += w_j * out[j]  # (user_len, hidden_size)
-            out_w[i] /= sum_w
+        # 5. Vectorized Flashback Weights
+        # dist_t: [seq_len, seq_len, user_len]
+        dist_t = t.unsqueeze(0) - t.unsqueeze(1)
+        dist_t = torch.clamp(dist_t, min=0)
 
-        out_pu = torch.zeros(seq_len, user_len, 2 * self.hidden_size, device=x.device)
-        for i in range(seq_len):
-            # (user_len, hidden_size * 2)
-            out_pu[i] = torch.cat([out_w[i], p_u], dim=1)
+        # dist_s: [seq_len, seq_len, user_len]
+        s_diff = s.unsqueeze(0) - s.unsqueeze(1)  # [seq_len, seq_len, user_len, 2]
+        dist_s = torch.norm(s_diff, dim=-1)
 
-        y_linear = self.fc(out_pu)  # (seq_len, user_len, loc_count)
+        a_j = self.f_t(dist_t, user_len)  # Expected to handle 3D input
+        b_j = self.f_s(dist_s, user_len)
+
+        # weights: [seq_len, seq_len, user_len]
+        # Multiply by similarity: similarity.permute(1, 0) is [user_len, seq_len]
+        # We need to match [seq_len, current_j, user_len]
+        sim_weight = user_loc_similarity.unsqueeze(0)  # [1, seq_len, user_len]
+        weights = (a_j * b_j + 1e-10) * sim_weight
+
+        # Masking future and sequence lengths
+        mask = torch.tril(torch.ones(seq_len, seq_len, device=device)).unsqueeze(-1)
+        weights = weights * mask
+
+        # 6. Weighted sum via BMM
+        # BMM: [Batch, N, M] x [Batch, M, P]
+        weights = weights.permute(2, 0, 1)  # [user_len, seq_len, seq_len]
+        out_trans = out.transpose(0, 1)  # [user_len, seq_len, hidden_size]
+
+        sum_w = torch.sum(weights, dim=-1, keepdim=True)  # [user_len, seq_len, 1]
+        out_w = torch.bmm(weights, out_trans) / (sum_w + 1e-10)  # [user_len, seq_len, hidden_size]
+        out_w = out_w.transpose(0, 1)  # [seq_len, user_len, hidden_size]
+
+        # 7. Final Projection
+        # Expand p_u for concatenation: [user_len, hidden_size] -> [seq_len, user_len, hidden_size]
+        p_u_expanded = p_u.unsqueeze(0).expand(seq_len, -1, -1)
+
+        out_pu = torch.cat([out_w, p_u_expanded], dim=-1)
+        y_linear = self.fc(out_pu)
 
         return y_linear, h
 

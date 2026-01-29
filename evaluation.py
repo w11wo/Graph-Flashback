@@ -1,6 +1,6 @@
+import logging
 import torch
 import numpy as np
-from utils import log_string
 
 
 class Evaluation:
@@ -18,18 +18,19 @@ class Evaluation:
     Using the --report_user argument one can access the statistics per user.
     """
 
-    def __init__(self, dataset, dataloader, user_count, h0_strategy, trainer, setting, log):
+    def __init__(self, dataset, dataloader, user_count, h0_strategy, trainer, setting):
         self.dataset = dataset
         self.dataloader = dataloader
         self.user_count = user_count
         self.h0_strategy = h0_strategy
         self.trainer = trainer
         self.setting = setting
-        self._log = log
 
     def evaluate(self):
         self.dataset.reset()
         h = self.h0_strategy.on_init(self.setting.batch_size, self.setting.device)
+
+        evaluated_traj_indices = set()
 
         with torch.no_grad():
             iter_cnt = 0
@@ -37,16 +38,26 @@ class Evaluation:
             recall5 = 0
             recall10 = 0
             average_precision = 0.0
+            ndcg5 = 0.0
 
             u_iter_cnt = np.zeros(self.user_count)
             u_recall1 = np.zeros(self.user_count)
             u_recall5 = np.zeros(self.user_count)
             u_recall10 = np.zeros(self.user_count)
             u_average_precision = np.zeros(self.user_count)
+            u_ndcg5 = np.zeros(self.user_count)
             reset_count = torch.zeros(self.user_count)
 
-            for i, (x, t, t_slot, s, y, y_t, y_t_slot, y_s, reset_h, active_users) in enumerate(self.dataloader):
-                active_users = active_users.squeeze()
+            for i, (x, t, t_slot, s, y, lengths, active_users, reset_h, traj_ids) in enumerate(self.dataloader):
+                x = x.squeeze(0).to(self.setting.device)
+                t = t.squeeze(0).to(self.setting.device)
+                t_slot = t_slot.squeeze(0).to(self.setting.device)
+                s = s.squeeze(0).to(self.setting.device)
+                y = y.squeeze(0)
+                lengths = lengths.squeeze(0).to(self.setting.device)
+                active_users = active_users.squeeze(0).to(self.setting.device)
+                traj_ids = traj_ids.squeeze(0)
+
                 for j, reset in enumerate(reset_h):
                     if reset:
                         if self.setting.is_lstm:
@@ -57,54 +68,55 @@ class Evaluation:
                             h[0, j] = self.h0_strategy.on_reset_test(active_users[j], self.setting.device)
                         reset_count[active_users[j]] += 1
 
-                # squeeze for reasons of "loader-batch-size-is-1"
-                x = x.squeeze().to(self.setting.device)
-                t = t.squeeze().to(self.setting.device)
-                t_slot = t_slot.squeeze().to(self.setting.device)
-                s = s.squeeze().to(self.setting.device)
-
-                y = y.squeeze()
-                y_t = y_t.squeeze().to(self.setting.device)
-                y_t_slot = y_t_slot.squeeze().to(self.setting.device)
-                y_s = y_s.squeeze().to(self.setting.device)
-                active_users = active_users.to(self.setting.device)
-
                 # evaluate:
-                out, h = self.trainer.evaluate(x, t, t_slot, s, y_t, y_t_slot, y_s, h, active_users)
+                out, h = self.trainer.evaluate(x, t, t_slot, s, lengths, h, active_users)
 
                 for j in range(self.setting.batch_size):
-                    # o contains a per user list of votes for all locations for each sequence entry
-                    o = out[j]
+                    t_idx = traj_ids[j].item()
 
-                    # partition elements
-                    o_n = o.cpu().detach().numpy()
-                    ind = np.argpartition(o_n, -10, axis=1)[:, -10:]  # top 10 elements
+                    if t_idx in evaluated_traj_indices:
+                        continue
+                    evaluated_traj_indices.add(t_idx)
 
-                    y_j = y[:, j]
+                    user_idx = active_users[j].item()
 
-                    for k in range(len(y_j)):
-                        if reset_count[active_users[j]] > 1:
-                            continue  # skip already evaluated users.
+                    # 3. Find the last valid index for this trajectory
+                    # If length is L, last input is at L-1, last prediction is at index L-1
+                    last_idx = lengths[j].item() - 1
 
-                        # resort indices for k:
-                        ind_k = ind[k]
-                        r = ind_k[np.argsort(-o_n[k, ind_k], axis=0)]  # sort top 10 elements descending
+                    # Logits for the last predicted POI
+                    o_n = out[j, last_idx].cpu().detach().numpy()
 
-                        r = torch.tensor(r)
-                        t = y_j[k]
+                    # Target POI
+                    target_poi = y[last_idx, j].item()
 
-                        # compute MAP:
-                        r_kj = o_n[k, :]
-                        t_val = r_kj[t]
-                        upper = np.where(r_kj > t_val)[0]
-                        precision = 1.0 / (1 + len(upper))
+                    # If the target is the padding value (-100), skip (shouldn't happen with trail_id logic)
+                    if target_poi == -100:
+                        continue
 
-                        # store
-                        u_iter_cnt[active_users[j]] += 1
-                        u_recall1[active_users[j]] += t in r[:1]
-                        u_recall5[active_users[j]] += t in r[:5]
-                        u_recall10[active_users[j]] += t in r[:10]
-                        u_average_precision[active_users[j]] += precision
+                    # Metrics calculation
+                    ind = np.argpartition(o_n, -10)[-10:]
+                    r = ind[np.argsort(-o_n[ind])]  # Top 10 sorted
+
+                    # NDCG@5
+                    curr_ndcg5 = 0.0
+                    for rank, pred in enumerate(r[:5]):
+                        if pred == target_poi:
+                            curr_ndcg5 = 1.0 / np.log2(rank + 2)
+                            break
+
+                    # MAP (Precision at the rank of the true POI)
+                    t_val = o_n[target_poi]
+                    upper = np.where(o_n > t_val)[0]
+                    precision = 1.0 / (1 + len(upper))
+
+                    # Accumulate
+                    u_iter_cnt[user_idx] += 1
+                    u_recall1[user_idx] += target_poi in r[:1]
+                    u_recall5[user_idx] += target_poi in r[:5]
+                    u_recall10[user_idx] += target_poi in r[:10]
+                    u_ndcg5[user_idx] += curr_ndcg5
+                    u_average_precision[user_idx] += precision
 
             formatter = "{0:.8f}"
             for j in range(self.user_count):
@@ -112,29 +124,20 @@ class Evaluation:
                 recall1 += u_recall1[j]
                 recall5 += u_recall5[j]
                 recall10 += u_recall10[j]
+                ndcg5 += u_ndcg5[j]
                 average_precision += u_average_precision[j]
 
-                if self.setting.report_user > 0 and (j + 1) % self.setting.report_user == 0:
-                    print(
-                        "Report user",
-                        j,
-                        "preds:",
-                        u_iter_cnt[j],
-                        "recall@1",
-                        formatter.format(u_recall1[j] / u_iter_cnt[j]),
-                        "MAP",
-                        formatter.format(u_average_precision[j] / u_iter_cnt[j]),
-                        sep="\t",
-                    )
+            logging.info(f"recall@1: {formatter.format(recall1 / iter_cnt)}")
+            logging.info(f"recall@5: {formatter.format(recall5 / iter_cnt)}")
+            logging.info(f"recall@10: {formatter.format(recall10 / iter_cnt)}")
+            logging.info(f"NDCG@5: {formatter.format(ndcg5 / iter_cnt)}")
+            logging.info(f"MAP: {formatter.format(average_precision / iter_cnt)}")
+            logging.info(f"predictions: {iter_cnt}")
 
-            # print('recall@1:', formatter.format(recall1 / iter_cnt))
-            # print('recall@5:', formatter.format(recall5 / iter_cnt))
-            # print('recall@10:', formatter.format(recall10 / iter_cnt))
-            # print('MAP', formatter.format(average_precision / iter_cnt))
-            # print('predictions:', iter_cnt)
-
-            log_string(self._log, "recall@1: " + formatter.format(recall1 / iter_cnt))
-            log_string(self._log, "recall@5: " + formatter.format(recall5 / iter_cnt))
-            log_string(self._log, "recall@10: " + formatter.format(recall10 / iter_cnt))
-            log_string(self._log, "MAP: " + formatter.format(average_precision / iter_cnt))
-            print("predictions:", iter_cnt)
+            return {
+                "recall1": recall1 / iter_cnt,
+                "recall5": recall5 / iter_cnt,
+                "recall10": recall10 / iter_cnt,
+                "ndcg5": ndcg5 / iter_cnt,
+                "map": average_precision / iter_cnt,
+            }
