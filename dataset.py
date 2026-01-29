@@ -5,8 +5,8 @@ from torch.utils.data import Dataset
 
 
 class Split(Enum):
-    """ Defines whether to split for train or test.
-    """
+    """Defines whether to split for train or test."""
+
     TRAIN = 0
     TEST = 1
 
@@ -71,12 +71,26 @@ class PoiDataset(Dataset):
         self.active_users = []
         self.active_user_seq = []
         for i in range(self.batch_size):
-            self.next_user_idx = (self.next_user_idx + 1) % len(self.users)  # 200(1024),下一活跃用户也即打乱后的第201个用户
+            self.next_user_idx = (self.next_user_idx + 1) % len(
+                self.users
+            )  # 200(1024),下一活跃用户也即打乱后的第201个用户
             self.active_users.append(self.user_permutation[i])  # 活跃用户为打乱后的前200个(1024)用户
             self.active_user_seq.append(0)
 
-    def __init__(self, users, times, time_slots, coords, locs, sequence_length, batch_size, split, usage, loc_count,
-                 custom_seq_count):
+    def __init__(
+        self,
+        users,
+        times,
+        time_slots,
+        coords,
+        locs,
+        sequence_length,
+        batch_size,
+        split,
+        usage,
+        loc_count,
+        custom_seq_count,
+    ):
         self.users = users
         self.locs = locs
         self.times = times
@@ -126,8 +140,17 @@ class PoiDataset(Dataset):
 
         # split to training / test phase:
         for i, (time, time_slot, coord, loc, label, lbl_time, lbl_time_slot, lbl_coord) in enumerate(
-                zip(self.times, self.time_slots, self.coords, self.locs, self.labels, self.lbl_times,
-                    self.lbl_time_slots, self.lbl_coords)):
+            zip(
+                self.times,
+                self.time_slots,
+                self.coords,
+                self.locs,
+                self.labels,
+                self.lbl_times,
+                self.lbl_time_slots,
+                self.lbl_coords,
+            )
+        ):
             train_thr = int(len(loc) * 0.8)
             if split == Split.TRAIN:
                 self.locs[i] = loc[:train_thr]
@@ -156,10 +179,21 @@ class PoiDataset(Dataset):
         self.min_seq_count = 10000000
         self.capacity = 0
         for i, (time, time_slot, coord, loc, label, lbl_time, lbl_time_slot, lbl_coord) in enumerate(
-                zip(self.times, self.time_slots, self.coords, self.locs, self.labels, self.lbl_times,
-                    self.lbl_time_slots, self.lbl_coords)):
+            zip(
+                self.times,
+                self.time_slots,
+                self.coords,
+                self.locs,
+                self.labels,
+                self.lbl_times,
+                self.lbl_time_slots,
+                self.lbl_coords,
+            )
+        ):
             seq_count = len(loc) // sequence_length  # 统计每个用户的sequence数目, 至少5个
-            assert seq_count > 0, 'fix seq-length and min-checkins in order to have at least one test sequence in a 80/20 split!'
+            assert (
+                seq_count > 0
+            ), "fix seq-length and min-checkins in order to have at least one test sequence in a 80/20 split!"
             seqs = []  # 二重列表,以固定长度子序列的形式来存放每个用户的check-ins
             seq_times = []
             seq_time_slots = []
@@ -200,19 +234,25 @@ class PoiDataset(Dataset):
 
         # statistics
         if self.usage == Usage.MIN_SEQ_LENGTH:
-            print(split, 'load', len(users), 'users with min_seq_count', self.min_seq_count, 'batches:', self.__len__())
+            print(split, "load", len(users), "users with min_seq_count", self.min_seq_count, "batches:", self.__len__())
         if self.usage == Usage.MAX_SEQ_LENGTH:
-            print(split, 'load', len(users), 'users with max_seq_count', self.max_seq_count, 'batches:', self.__len__())
+            print(split, "load", len(users), "users with max_seq_count", self.max_seq_count, "batches:", self.__len__())
         if self.usage == Usage.CUSTOM:
-            print(split, 'load', len(users), 'users with custom_seq_count', self.custom_seq_count, 'Batches:',
-                  self.__len__())
+            print(
+                split,
+                "load",
+                len(users),
+                "users with custom_seq_count",
+                self.custom_seq_count,
+                "Batches:",
+                self.__len__(),
+            )
 
     def sequences_by_user(self, idx):
         return self.sequences[idx]
 
     def __len__(self):
-        """ Amount of available batches to process each sequence at least once.
-        """
+        """Amount of available batches to process each sequence at least once."""
 
         if self.usage == Usage.MIN_SEQ_LENGTH:
             # min times amount_of_user_batches:
@@ -226,7 +266,7 @@ class PoiDataset(Dataset):
         raise ValueError()
 
     def __getitem__(self, idx):
-        """ Against pytorch convention, we directly build a full batch inside __getitem__.
+        """Against pytorch convention, we directly build a full batch inside __getitem__.
         Use a batch_size of 1 in your pytorch data loader.
 
         A batch consists of a list of active users,

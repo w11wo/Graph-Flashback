@@ -36,7 +36,7 @@ class Evaluation:
             recall1 = 0
             recall5 = 0
             recall10 = 0
-            average_precision = 0.
+            average_precision = 0.0
 
             u_iter_cnt = np.zeros(self.user_count)
             u_recall1 = np.zeros(self.user_count)
@@ -97,7 +97,7 @@ class Evaluation:
                         r_kj = o_n[k, :]
                         t_val = r_kj[t]
                         upper = np.where(r_kj > t_val)[0]
-                        precision = 1. / (1 + len(upper))
+                        precision = 1.0 / (1 + len(upper))
 
                         # store
                         u_iter_cnt[active_users[j]] += 1
@@ -115,9 +115,17 @@ class Evaluation:
                 average_precision += u_average_precision[j]
 
                 if self.setting.report_user > 0 and (j + 1) % self.setting.report_user == 0:
-                    print('Report user', j, 'preds:', u_iter_cnt[j], 'recall@1',
-                          formatter.format(u_recall1[j] / u_iter_cnt[j]), 'MAP',
-                          formatter.format(u_average_precision[j] / u_iter_cnt[j]), sep='\t')
+                    print(
+                        "Report user",
+                        j,
+                        "preds:",
+                        u_iter_cnt[j],
+                        "recall@1",
+                        formatter.format(u_recall1[j] / u_iter_cnt[j]),
+                        "MAP",
+                        formatter.format(u_average_precision[j] / u_iter_cnt[j]),
+                        sep="\t",
+                    )
 
             # print('recall@1:', formatter.format(recall1 / iter_cnt))
             # print('recall@5:', formatter.format(recall5 / iter_cnt))
@@ -125,8 +133,8 @@ class Evaluation:
             # print('MAP', formatter.format(average_precision / iter_cnt))
             # print('predictions:', iter_cnt)
 
-            log_string(self._log, 'recall@1: ' + formatter.format(recall1 / iter_cnt))
-            log_string(self._log, 'recall@5: ' + formatter.format(recall5 / iter_cnt))
-            log_string(self._log, 'recall@10: ' + formatter.format(recall10 / iter_cnt))
-            log_string(self._log, 'MAP: ' + formatter.format(average_precision / iter_cnt))
-            print('predictions:', iter_cnt)
+            log_string(self._log, "recall@1: " + formatter.format(recall1 / iter_cnt))
+            log_string(self._log, "recall@5: " + formatter.format(recall5 / iter_cnt))
+            log_string(self._log, "recall@10: " + formatter.format(recall10 / iter_cnt))
+            log_string(self._log, "MAP: " + formatter.format(average_precision / iter_cnt))
+            print("predictions:", iter_cnt)

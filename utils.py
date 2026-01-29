@@ -20,22 +20,22 @@ def load_graph_data(pkl_filename):
 
 def load_pickle(pickle_file):
     try:
-        with open(pickle_file, 'rb') as f:
+        with open(pickle_file, "rb") as f:
             pickle_data = pickle.load(f)
     except UnicodeDecodeError as e:
-        with open(pickle_file, 'rb') as f:
-            pickle_data = pickle.load(f, encoding='latin1')
+        with open(pickle_file, "rb") as f:
+            pickle_data = pickle.load(f, encoding="latin1")
     except Exception as e:
-        print('Unable to load data ', pickle_file, ': ', e)
+        print("Unable to load data ", pickle_file, ": ", e)
         raise
     return pickle_data
 
 
 def calculate_preference_similarity(m1, m2, pref):
     """
-        m1: (user_len, hidden_size)
-        m2：(user_len, seq_len, hidden_size)
-        return: calculate the similarity between user and location, which means user's preference about location
+    m1: (user_len, hidden_size)
+    m2：(user_len, seq_len, hidden_size)
+    return: calculate the similarity between user and location, which means user's preference about location
     """
     user_len = m1.shape[0]
     seq_len = m2.shape[1]
@@ -77,9 +77,9 @@ def compute_preference(m1, m2, pref):
 
 def get_user_static_preference(pref, locs):
     """
-        pref: (user_len, seq_len)
-        locs: (user_len, seq_len, hidden_size)
-        return: 返回用户对于所访问POI的全局偏好
+    pref: (user_len, seq_len)
+    locs: (user_len, seq_len, hidden_size)
+    return: 返回用户对于所访问POI的全局偏好
     """
     # pref = torch.softmax(pref, dim=1)  # (user_len, seq_len)
     # pref = pref.unsqueeze(2)  # (user_len, seq_len, 1)
@@ -90,8 +90,9 @@ def get_user_static_preference(pref, locs):
     user_preference = torch.zeros(user_len, seq_len, hidden_size)
     for i in range(user_len):
         for j in range(seq_len):  # (hidden_size, )
-            user_preference[i][j] = torch.sum(torch.softmax(pref[i, :j + 1], dim=0).unsqueeze(1) * locs[i, :j + 1],
-                                              dim=0)
+            user_preference[i][j] = torch.sum(
+                torch.softmax(pref[i, : j + 1], dim=0).unsqueeze(1) * locs[i, : j + 1], dim=0
+            )
     user_preference = user_preference.permute(1, 0, 2)  # (seq_len, user_len, hidden_size)
 
     return user_preference
@@ -123,7 +124,7 @@ def sampling_prob(prob, label, num_neg):
 
 
 def bprLoss(pos, neg, target=1.0):
-    loss = - F.logsigmoid(target * (pos - neg))
+    loss = -F.logsigmoid(target * (pos - neg))
     return loss.mean()
 
 
@@ -151,10 +152,10 @@ def top_transition_graph(transition_graph):
     threshold = 20
 
     for i in range(0, row.size, threshold):
-        row_data = data[i: i + threshold]
+        row_data = data[i : i + threshold]
         norm = row_data.max()
         row_data = row_data / norm
-        data[i: i + threshold] = row_data
+        data[i : i + threshold] = row_data
 
     return graph
 
@@ -175,7 +176,7 @@ def calculate_random_walk_matrix(adj_mx):
     adj_mx = sp.coo_matrix(adj_mx)
     d = np.array(adj_mx.sum(1))
     d_inv = np.power(d, -1).flatten()
-    d_inv[np.isinf(d_inv)] = 0.
+    d_inv[np.isinf(d_inv)] = 0.0
     d_mat_inv = sp.diags(d_inv)
     random_walk_mx = d_mat_inv.dot(adj_mx).tocoo()
 
@@ -189,15 +190,16 @@ def calculate_reverse_random_walk_matrix(adj_mx):
 
 def log_string(log, string):
     """打印log"""
-    log.write(string + '\n')
+    log.write(string + "\n")
     log.flush()
     print(string)
 
-if __name__ == '__main__':
-    graph_path = 'data/user_similarity_graph.pkl'
+
+if __name__ == "__main__":
+    graph_path = "data/user_similarity_graph.pkl"
     user_similarity_matrix = torch.tensor(load_graph_data(pkl_filename=graph_path))
     print(user_similarity_matrix[1])
-    print('................')
+    print("................")
     print(user_similarity_matrix[1][:10])
     count = 0
     # for i in range(user_similarity_matrix.shape[0]):
@@ -205,4 +207,4 @@ if __name__ == '__main__':
     #         if user_similarity_matrix[i][j] > 0.01:  # 5747013, 即9.5%
     #             count += 1
 
-    print('count: ', count)
+    print("count: ", count)
