@@ -6,6 +6,7 @@ import pickle
 from tqdm import tqdm
 from scipy.sparse import lil_matrix
 import argparse
+from dataloader import PoiDataloader
 
 device = torch.device("cuda", 0)
 
@@ -168,25 +169,29 @@ def get_parser():
     )
     parser.add_argument("--version", default="scheme1", type=str, help="which version of KG")
     parser.add_argument("--threshold", default=20, type=int, help="top_K")
-    parser.add_argument(
-        "--user_count", default=45343, type=int, help="number of user"
-    )  # gowalla: 7768    foursquare: 45343
-    parser.add_argument(
-        "--loc_count", default=68879, type=int, help="number of POI"
-    )  # gowalla: 106994 foursquare: 68879
     parser.add_argument("--L1_flag", default=True, type=bool, help="whether to use L1 or L2 norm")
     parser.add_argument("--loc_graph", default=True, type=bool, help="whether to construct POI or user graph")
     parser.add_argument(
         "--loc_spatial", default=False, type=bool, help="whether to construct temporal or spatial POI graph"
     )
+    parser.add_argument("--sequence_length", default=20, type=int, help="length of input sequences")
+    parser.add_argument("--dataset_train_file", required=True, type=str)
+    parser.add_argument("--dataset_val_file", required=True, type=str)
+    parser.add_argument("--dataset_test_file", required=True, type=str)
     args = parser.parse_args()
     return args
 
 
 def main():
     args = get_parser()
+    poi_loader = PoiDataloader(0, args.sequence_length + 1)
+    poi_loader.read(args.dataset_train_file, args.dataset_val_file, args.dataset_test_file)
+
+    user_count, loc_count = poi_loader.user_count(), poi_loader.locations()
+    args.user_count = user_count
+    args.loc_count = loc_count
+
     pretrain_model = torch.load(args.pretrain_model, map_location=lambda storage, loc: storage)
-    user_count = args.user_count
     if args.loc_graph:
         graph_type = "loc"
         if args.loc_spatial:
